@@ -90,6 +90,7 @@ from lionz import models
 from lionz import predict
 from lionz import telemetry
 from lionz import cli_theme as theme
+from lionz import dynamic
 from lionz.models import (
     AVAILABLE_MODELS,
     MODEL_METADATA,
@@ -102,6 +103,95 @@ from lionz.models import (
 
 
 from lionz.nnUNet_custom_trainer.utility import add_custom_trainers_to_local_nnunetv2
+
+
+def _is_4d_nifti(file_path: str) -> bool:
+    """Check if a NIfTI file is 4D."""
+    img = SimpleITK.ReadImage(file_path)
+    return img.GetDimension() == 4 and img.GetSize()[3] > 1
+
+
+def _extract_last_frame(file_path: str) -> SimpleITK.Image:
+    """Extract the last frame from a 4D NIfTI as a 3D image."""
+    img_4d = SimpleITK.ReadImage(file_path)
+    size = list(img_4d.GetSize())
+    extractor = SimpleITK.ExtractImageFilter()
+    extractor.SetSize([size[0], size[1], size[2], 0])
+    extractor.SetIndex([0, 0, 0, size[3] - 1])
+    return extractor.Execute(img_4d)
+
+
+def _get_subject_pt_file(subject: str) -> str | None:
+    """Find the first PT_ NIfTI file in a subject directory."""
+    for prefix in ('PT_', 'PT-'):
+        files = file_utilities.get_files(subject, prefix, ('.nii', '.nii.gz'))
+        if files:
+            return files[0]
+    return None
+
+
+def _dispatch_subject(
+    subject: str,
+    subject_index: int,
+    number_of_subjects: int,
+    model_routine: dict,
+    accelerator: str,
+    output_manager: system.OutputManager | None,
+    threshold: float | None,
+    generate_mip: bool,
+    static_mode: bool,
+):
+    """
+    Route a subject to the appropriate pipeline based on whether the input is
+    4D (dynamic) or 3D (static).
+    """
+    pt_file = _get_subject_pt_file(subject)
+    if pt_file is None:
+        if output_manager:
+            output_manager.warn(f"No PT files for {os.path.basename(subject)}, skipping")
+        return
+
+    is_4d = _is_4d_nifti(pt_file)
+
+    if is_4d and not static_mode:
+        # Dynamic pipeline
+        return dynamic.run_dynamic_pipeline(
+            subject, subject_index, number_of_subjects,
+            model_routine, accelerator, output_manager,
+            threshold, generate_mip,
+        )
+    elif is_4d and static_mode:
+        # Extract last frame as a separate 3D file, then run static pipeline
+        if output_manager is None:
+            output_manager = system.OutputManager(False, False)
+        output_manager.info(f"Static mode: extracting last frame from 4D image for {os.path.basename(subject)}")
+        last_frame = _extract_last_frame(pt_file)
+        # Write the last frame next to the original, with PT_ prefix so lion_subject finds it
+        stem = file_utilities.get_nifti_file_stem(pt_file)
+        static_path = os.path.join(os.path.dirname(pt_file), f"PT_{stem}_last_frame.nii.gz")
+        SimpleITK.WriteImage(last_frame, static_path)
+        # Temporarily rename original so lion_subject picks up the 3D file
+        backup_path = pt_file + ".4d_backup"
+        os.rename(pt_file, backup_path)
+        try:
+            result = lion_subject(
+                subject, subject_index, number_of_subjects,
+                model_routine, accelerator, output_manager,
+                threshold, generate_mip,
+            )
+        finally:
+            # Restore original 4D file and clean up
+            os.rename(backup_path, pt_file)
+            if os.path.exists(static_path):
+                os.remove(static_path)
+        return result
+    else:
+        # Standard 3D pipeline
+        return lion_subject(
+            subject, subject_index, number_of_subjects,
+            model_routine, accelerator, output_manager,
+            threshold, generate_mip,
+        )
 
 
 def execute_model_download(
@@ -148,6 +238,7 @@ def execute_cli(
     verbose_log: bool,
     generate_mip: bool,
     lions_pride: int | None,
+    static_mode: bool = False,
 ) -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s",
@@ -303,18 +394,19 @@ def execute_cli(
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=lion_instances, mp_context=mp_context) as executor:
             futures = []
-            for i, (subject, accelerator) in enumerate(zip(prediction_subjects, accelerator_assignments)):
+            for i, (subject, accel) in enumerate(zip(prediction_subjects, accelerator_assignments)):
                 futures.append(
                     executor.submit(
-                        lion_subject,
+                        _dispatch_subject,
                         subject,
                         i,
                         num_subjects,
                         model_routine,
-                        accelerator,
+                        accel,
                         None,
                         effective_threshold,
                         generate_mip_output,
+                        static_mode,
                     )
                 )
 
@@ -324,7 +416,7 @@ def execute_cli(
 
     else:
         for i, subject in enumerate(prediction_subjects):
-            lion_subject(
+            _dispatch_subject(
                 subject,
                 i,
                 num_subjects,
@@ -333,6 +425,7 @@ def execute_cli(
                 output_manager,
                 effective_threshold,
                 generate_mip_output,
+                static_mode,
             )
 
     end_total_time = time.time()
@@ -433,6 +526,14 @@ def execute_cli(
     help="Number of concurrent jobs (set to 2 or more to enable parallel execution).",
 )
 @click.option(
+    "-s",
+    "--static",
+    "static_mode",
+    is_flag=True,
+    default=False,
+    help="Force static (last-frame-only) processing of 4D PET images.",
+)
+@click.option(
     "-md",
     "--model-download",
     "model_download",
@@ -457,6 +558,7 @@ def main(
     verbose_off: bool,
     logging_off: bool,
     generate_mip: bool,
+    static_mode: bool,
     lions_pride: int | None,
     model_download: str | None,
     model_download_directory: str | None,
@@ -501,6 +603,7 @@ def main(
             verbose_log=verbose_log,
             generate_mip=generate_mip,
             lions_pride=lions_pride,
+            static_mode=static_mode,
         )
     except click.ClickException:
         raise

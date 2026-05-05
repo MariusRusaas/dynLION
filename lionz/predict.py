@@ -62,9 +62,30 @@ def preprocessing_iterator_from_array(image_array: np.ndarray, image_properties:
     return iterator
 
 
-def predict_from_array_by_iterator(image_array: np.ndarray, model: models.Model, accelerator: str, nnunet_log_filename: str = None) -> np.ndarray:
-    image_array = image_array[None, ...]
+def predict_with_predictor(predictor: nnUNetPredictor, image_array: np.ndarray, model: models.Model) -> np.ndarray:
+    """
+    Run prediction using an already-initialized predictor. Useful for processing
+    multiple frames without re-initializing the model each time.
 
+    :param predictor: An already-initialized nnUNetPredictor.
+    :param image_array: 3D numpy array (Z, Y, X).
+    :param model: The model object with voxel_spacing and tumor_label.
+    :return: Binary segmentation array (0/1).
+    """
+    image_array = image_array[None, ...]
+    image_properties = {'spacing': model.voxel_spacing}
+
+    iterator = preprocessing_iterator_from_array(image_array, image_properties, predictor)
+    segmentations = predictor.predict_from_data_iterator(iterator)
+    segmentations = [segmentation[None, ...] for segmentation in segmentations]
+    combined_segmentations = np.squeeze(segmentations)
+    combined_segmentations[combined_segmentations != model.tumor_label] = 0
+    combined_segmentations[combined_segmentations == model.tumor_label] = 1
+
+    return combined_segmentations
+
+
+def predict_from_array_by_iterator(image_array: np.ndarray, model: models.Model, accelerator: str, nnunet_log_filename: str = None) -> np.ndarray:
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     nnunet_log_file = None
@@ -75,18 +96,7 @@ def predict_from_array_by_iterator(image_array: np.ndarray, model: models.Model,
 
     try:
         predictor = initialize_predictor(model, accelerator)
-        image_properties = {
-            'spacing': model.voxel_spacing
-        }
-
-        iterator = preprocessing_iterator_from_array(image_array, image_properties, predictor)
-        segmentations = predictor.predict_from_data_iterator(iterator)
-        segmentations = [segmentation[None, ...] for segmentation in segmentations]
-        combined_segmentations = np.squeeze(segmentations)
-        combined_segmentations[combined_segmentations != model.tumor_label] = 0
-        combined_segmentations[combined_segmentations == model.tumor_label] = 1
-
-        return combined_segmentations
+        return predict_with_predictor(predictor, image_array, model)
 
     finally:
         sys.stdout = original_stdout
